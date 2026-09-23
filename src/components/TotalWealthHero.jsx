@@ -57,7 +57,6 @@ export default function TotalWealthHero({
   const hasDayChange = dayChangeVal !== null && dayChangeVal !== undefined;
   const isPositiveDay = hasDayChange && dayChangeVal > 0;
   const isNegativeDay = hasDayChange && dayChangeVal < 0;
-  const isZeroDay = hasDayChange && dayChangeVal === 0;
 
   // P&L indicator
   const hasPnl = profitLoss !== null && profitLoss !== undefined;
@@ -72,6 +71,16 @@ export default function TotalWealthHero({
       {isEmpty ? (
         <div className="change-indicator neutral" style={{ marginTop: 8, fontSize: '0.9rem', color: 'var(--text-muted)' }}>
           <span>No investments connected yet.</span>
+          {onConnectFirst && (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={onConnectFirst}
+              style={{ marginLeft: 10, fontSize: '0.8rem', padding: '2px 10px' }}
+            >
+              + Connect
+            </button>
+          )}
         </div>
       ) : hasDayChange ? (
         <div className={`change-indicator ${isPositiveDay ? 'positive' : isNegativeDay ? 'negative' : 'neutral'}`}>
