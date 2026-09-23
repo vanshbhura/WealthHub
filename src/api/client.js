@@ -1,6 +1,11 @@
 // Centralized API Client for WealthHub
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+const API_BASE_URL =
+  import.meta.env.VITE_API_URL !== undefined && import.meta.env.VITE_API_URL !== ''
+    ? import.meta.env.VITE_API_URL
+    : import.meta.env.PROD
+    ? 'https://wealthhub.antideploy.com'
+    : 'http://127.0.0.1:8000';
 const TOKEN_KEY = 'wealthhub_jwt_token';
 const REFRESH_KEY = 'wealthhub_refresh_token';
 

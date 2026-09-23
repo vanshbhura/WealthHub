@@ -1,6 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+from pathlib import Path
 
 from app.config import settings
 from app.database import engine, Base
@@ -70,14 +74,21 @@ app.include_router(portfolio.router)
 app.include_router(imports.router)
 app.include_router(account_aggregator.router)
 
+# Locate root-level frontend build directory
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DIST_DIR = Path(os.environ.get("FRONTEND_DIST_DIR", BASE_DIR / "dist")).resolve()
 
-@app.get("/", tags=["Health"])
-def root():
+# Mount frontend assets if directory exists
+assets_dir = DIST_DIR / "assets"
+if assets_dir.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+
+@app.get("/api/health", tags=["Health"])
+def api_health():
     return {
-        "app": "WealthHub API",
-        "version": "1.0.0",
-        "status": "online",
-        "docs": "/docs"
+        "status": "healthy",
+        "environment": settings.ENVIRONMENT
     }
 
 
@@ -87,3 +98,46 @@ def health_check():
         "status": "healthy",
         "environment": settings.ENVIRONMENT
     }
+
+
+@app.get("/", include_in_schema=False)
+async def serve_root():
+    index_file = DIST_DIR / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file)
+    return {
+        "app": "WealthHub API",
+        "version": "1.0.0",
+        "status": "online",
+        "docs": "/docs",
+        "message": "Frontend build not found. Run 'npm run build' to generate dist/."
+    }
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_spa(full_path: str):
+    # Guard: API endpoints must never be swallowed by the SPA fallback
+    if full_path.startswith("api/") or full_path == "api":
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "ENDPOINT_NOT_FOUND", "message": f"API endpoint '/{full_path}' not found"}
+        )
+
+    # Guard: FastAPI docs routes
+    if full_path in ("docs", "redoc", "openapi.json"):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    # Serve static file from dist root if it exists (e.g. favicon.ico, vite.svg)
+    candidate_file = DIST_DIR / full_path
+    if candidate_file.is_file():
+        return FileResponse(candidate_file)
+
+    # SPA client-side routing fallback: return dist/index.html
+    index_file = DIST_DIR / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file)
+
+    raise HTTPException(
+        status_code=404,
+        detail="Frontend build not found. Run 'npm run build' to generate dist/."
+    )

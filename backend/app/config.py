@@ -20,6 +20,7 @@ class Settings(BaseSettings):
         "http://localhost:5176",
         "http://127.0.0.1:5176",
         "http://localhost:3000",
+        "https://wealthhub.antideploy.com",
     ]
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
