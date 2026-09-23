@@ -4,27 +4,60 @@ import { TotalWealthHeroSkeleton } from './Skeletons';
 
 export default function TotalWealthHero({
   summary,
-  isLoading = false
+  currentTotal,
+  dayChange,
+  dayChangePercent,
+  investedAmount,
+  totalProfitLoss,
+  totalReturnPercentage,
+  isLoading = false,
+  isError = false,
+  errorMessage = null,
+  onRetry = null,
+  onConnectFirst = null,
 }) {
   if (isLoading) {
     return <TotalWealthHeroSkeleton />;
   }
 
-  const totalWealth = summary?.total_wealth ?? 0;
-  const investedValue = summary?.invested_value ?? 0;
-  const profitLoss = summary?.profit_loss ?? 0;
-  const profitLossPct = summary?.profit_loss_percentage;
-  const dayChange = summary?.today_change;
-  const dayChangePct = summary?.today_change_percentage;
+  if (isError) {
+    return (
+      <section className="wealth-hero" aria-label="Total Wealth Overview">
+        <div className="wealth-label">TOTAL WEALTH</div>
+        <div style={{ padding: '16px 0', color: 'var(--text-danger, #ef4444)' }}>
+          <p style={{ margin: '0 0 10px 0', fontSize: '0.95rem', fontWeight: 500 }}>
+            {errorMessage || 'Unable to load total wealth.'}
+          </p>
+          {onRetry && (
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={onRetry}
+              style={{ fontSize: '0.82rem', padding: '5px 14px' }}
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      </section>
+    );
+  }
+
+  const totalWealth = summary?.total_wealth ?? currentTotal ?? 0;
+  const investedValue = summary?.invested_value ?? summary?.invested_amount ?? investedAmount ?? 0;
+  const profitLoss = summary?.profit_loss ?? summary?.total_profit_loss ?? totalProfitLoss ?? (totalWealth - investedValue);
+  const profitLossPct = summary?.profit_loss_percentage ?? summary?.total_return_percentage ?? totalReturnPercentage ?? (investedValue > 0 ? (profitLoss / investedValue) * 100 : undefined);
+  const dayChangeVal = summary?.today_change !== undefined ? summary?.today_change : dayChange;
+  const dayChangePctVal = summary?.today_change_percentage !== undefined ? summary?.today_change_percentage : dayChangePercent;
   const assetCount = summary?.asset_count ?? 0;
 
   const isEmpty = totalWealth === 0 && investedValue === 0 && assetCount === 0;
 
   // Movement indicator
-  const hasDayChange = dayChange !== null && dayChange !== undefined;
-  const isPositiveDay = hasDayChange && dayChange > 0;
-  const isNegativeDay = hasDayChange && dayChange < 0;
-  const isZeroDay = hasDayChange && dayChange === 0;
+  const hasDayChange = dayChangeVal !== null && dayChangeVal !== undefined;
+  const isPositiveDay = hasDayChange && dayChangeVal > 0;
+  const isNegativeDay = hasDayChange && dayChangeVal < 0;
+  const isZeroDay = hasDayChange && dayChangeVal === 0;
 
   // P&L indicator
   const hasPnl = profitLoss !== null && profitLoss !== undefined;
@@ -42,9 +75,9 @@ export default function TotalWealthHero({
         </div>
       ) : hasDayChange ? (
         <div className={`change-indicator ${isPositiveDay ? 'positive' : isNegativeDay ? 'negative' : 'neutral'}`}>
-          <span>{formatINR(dayChange, { showSign: true })} today</span>
-          {dayChangePct !== null && dayChangePct !== undefined && (
-            <span>({formatPercent(dayChangePct, true)})</span>
+          <span>{formatINR(dayChangeVal, { showSign: true })} today</span>
+          {dayChangePctVal !== null && dayChangePctVal !== undefined && (
+            <span>({formatPercent(dayChangePctVal, true)})</span>
           )}
         </div>
       ) : (

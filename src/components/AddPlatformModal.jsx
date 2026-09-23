@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Search, X, ArrowLeft, Shield, PlusCircle, Bell, Check, Info, UploadCloud } from 'lucide-react';
 import { platformsApi } from '../api/platforms';
 import PlatformLogo from './PlatformLogo';
@@ -56,8 +56,7 @@ export default function AddPlatformModal({
   }, [connectedPlatformIds, catalog]);
 
   // Fetch catalog from backend GET /api/platforms
-  useEffect(() => {
-    if (!isOpen) return;
+  const fetchCatalog = useCallback(() => {
     setIsLoading(true);
     setError(null);
     platformsApi.getPlatforms()
@@ -66,12 +65,17 @@ export default function AddPlatformModal({
       })
       .catch(err => {
         console.error('Error fetching platforms catalog:', err);
-        setError('Unable to load platforms catalog.');
+        setError(err.message || 'Unable to load platforms catalog.');
       })
       .finally(() => {
         setIsLoading(false);
       });
-  }, [isOpen]);
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    fetchCatalog();
+  }, [isOpen, fetchCatalog]);
 
   // When a platform is selected, fetch its supported connection methods
   useEffect(() => {
@@ -345,7 +349,15 @@ export default function AddPlatformModal({
                     </div>
                   ) : error ? (
                     <div style={{ padding: '24px', textAlign: 'center', color: '#ef4444' }}>
-                      <span>{error}</span>
+                      <p style={{ margin: '0 0 12px 0' }}>{error}</p>
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        onClick={fetchCatalog}
+                        style={{ fontSize: '0.82rem', padding: '6px 16px' }}
+                      >
+                        Retry
+                      </button>
                     </div>
                   ) : filteredCatalog.length === 0 ? (
                     <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-muted)' }}>

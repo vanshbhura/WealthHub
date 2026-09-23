@@ -34,6 +34,16 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
+
+@app.on_event("startup")
+def startup_event():
+    # Ensure platform catalog is seeded idempotently on startup
+    try:
+        from app.seed import seed_platforms
+        seed_platforms()
+    except Exception as e:
+        print(f"Warning: platform seed on startup failed: {e}")
+
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,

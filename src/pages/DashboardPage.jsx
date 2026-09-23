@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Greeting from '../components/Greeting';
 import TotalWealthHero from '../components/TotalWealthHero';
@@ -29,11 +29,36 @@ export default function DashboardPage({
 }) {
   const navigate = useNavigate();
 
-  // Determine current total, day change, day change percentage
+  // Determine current total, day change, day change percentage using single source of truth
   const isLive = Boolean(currentUser && summary);
-  const currentTotal = isLive ? summary.total_wealth : displayedPlatforms.reduce((acc, p) => acc + (p.current_value || p.currentValue || 0), 0);
-  const dayChange = isLive ? summary.today_change : displayedPlatforms.reduce((acc, p) => acc + (p.today_change || p.dayChange || 0), 0);
-  const dayChangePercent = isLive ? summary.today_change_percentage : (currentTotal > 0 ? (dayChange / currentTotal) * 100 : null);
+
+  const activeSummary = useMemo(() => {
+    if (isLive && summary) {
+      return summary;
+    }
+    const totalWealth = displayedPlatforms.reduce((acc, p) => acc + (p.current_value || p.currentValue || 0), 0);
+    const investedVal = displayedPlatforms.reduce((acc, p) => acc + (p.invested_value || p.investedValue || 0), 0);
+    const pl = totalWealth - investedVal;
+    const plPct = investedVal > 0 ? (pl / investedVal) * 100 : 0;
+    const dayDelta = displayedPlatforms.reduce((acc, p) => acc + (p.today_change || p.dayChange || 0), 0);
+    const dayDeltaPct = totalWealth > 0 ? (dayDelta / totalWealth) * 100 : null;
+    const assetCnt = displayedPlatforms.reduce((acc, p) => acc + (p.holdings?.length || p.asset_count || 1), 0);
+
+    return {
+      total_wealth: totalWealth,
+      invested_value: investedVal,
+      profit_loss: pl,
+      profit_loss_percentage: plPct,
+      today_change: dayDelta,
+      today_change_percentage: dayDeltaPct,
+      asset_count: assetCnt,
+      platform_count: displayedPlatforms.length,
+    };
+  }, [isLive, summary, displayedPlatforms]);
+
+  const currentTotal = activeSummary.total_wealth;
+  const dayChange = activeSummary.today_change;
+  const dayChangePercent = activeSummary.today_change_percentage;
 
   const handleSelectPlatform = (platform) => {
     const id = platform.platform_id || platform.id || platform.platform_slug;
@@ -43,17 +68,21 @@ export default function DashboardPage({
   return (
     <div className="dashboard-content">
       {/* 1. GREETING */}
-      <Greeting userName={currentUser ? currentUser.full_name.split(' ')[0] : 'Aditya'} />
+      <Greeting userName={currentUser ? currentUser.full_name.split(' ')[0] : 'Vansh'} />
 
       {/* 2 & 3. TOTAL WEALTH HERO & SECONDARY METRICS ROW */}
       <TotalWealthHero
+        summary={activeSummary}
         currentTotal={currentTotal}
         dayChange={dayChange}
         dayChangePercent={dayChangePercent}
-        investedAmount={summary?.invested_amount}
-        totalProfitLoss={summary?.total_profit_loss}
-        totalReturnPercentage={summary?.total_return_percentage}
+        investedAmount={activeSummary.invested_value}
+        totalProfitLoss={activeSummary.profit_loss}
+        totalReturnPercentage={activeSummary.profit_loss_percentage}
         isLoading={isLoadingPortfolio}
+        isError={Boolean(portfolioError)}
+        errorMessage={portfolioError}
+        onRetry={() => loadPortfolioData(activeTimeframe)}
         onConnectFirst={() => setIsAddModalOpen(true)}
       />
 

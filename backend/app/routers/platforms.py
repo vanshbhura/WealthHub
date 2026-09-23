@@ -30,6 +30,14 @@ def list_platforms(
 
     stmt = stmt.order_by(Platform.name.asc())
     platforms = list(db.execute(stmt).scalars().all())
+    if not platforms:
+        # Lazy seed if database has not yet been populated
+        has_any = db.execute(select(Platform.id)).first()
+        if not has_any:
+            from app.seed import seed_platforms
+            seed_platforms()
+            platforms = list(db.execute(stmt).scalars().all())
+
     return [PlatformResponse.model_validate(p) for p in platforms]
 
 
