@@ -31,8 +31,9 @@ class Settings(BaseSettings):
     GROWW_TIMEOUT_SECONDS: float = 15.0
 
     # Setu Account Aggregator (AA) Sandbox configuration
-    SETU_ENVIRONMENT: str = "sandbox"
+    SETU_ENVIRONMENT: str = "mock"
     SETU_BASE_URL: str = "https://fiu-sandbox.setu.co"
+    SETU_AUTH_URL: Optional[str] = None
     SETU_CLIENT_ID: Optional[str] = None
     SETU_CLIENT_SECRET: Optional[str] = None
     SETU_PRODUCT_INSTANCE_ID: Optional[str] = None

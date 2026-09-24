@@ -1,5 +1,6 @@
 import os
 import uuid
+import time
 import pytest
 import httpx
 from datetime import datetime, date, timedelta
@@ -189,7 +190,11 @@ async def test_consent_authorized():
 @pytest.mark.anyio
 async def test_consent_rejected():
     client = SetuAAClient(
-        client_id="id", client_secret="sec", product_instance_id="inst", force_sandbox_mock=False
+        client_id="id",
+        client_secret="sec",
+        product_instance_id="inst",
+        auth_token="mock_auth_token",
+        force_sandbox_mock=False,
     )
     mock_resp = MagicMock()
     mock_resp.status_code = 200
@@ -206,7 +211,11 @@ async def test_consent_rejected():
 @pytest.mark.anyio
 async def test_consent_expired():
     client = SetuAAClient(
-        client_id="id", client_secret="sec", product_instance_id="inst", force_sandbox_mock=False
+        client_id="id",
+        client_secret="sec",
+        product_instance_id="inst",
+        auth_token="mock_auth_token",
+        force_sandbox_mock=False,
     )
     mock_resp = MagicMock()
     mock_resp.status_code = 200
@@ -720,7 +729,7 @@ async def test_live_setu_sandbox_integration():
 
     client = SetuAAClient(force_sandbox_mock=False)
     res = await client.health_check()
-    assert res["status"] in ("healthy", "unauthorized", "unavailable", "degraded")
+    assert res["status"] in ("healthy", "unauthorized", "provider_unavailable", "unavailable", "degraded")
 
 
 # ---------------------------------------------------------
@@ -785,7 +794,7 @@ async def test_health_check_mock_vs_real():
     assert real_res["status"] == "configuration_error"
     assert "SETU_CONFIGURATION_ERROR" in real_res["error"]
 
-    # C. Real mode with credentials (mocking HTTP 200)
+    # C. Real mode with credentials (mocking HTTP 200 with OAuth token + gateway health)
     real_client_with_creds = SetuAAClient(
         client_id="id1",
         client_secret="sec1",
@@ -794,7 +803,11 @@ async def test_health_check_mock_vs_real():
     )
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = {"status": "UP"}
+    mock_resp.json.return_value = {
+        "status": "UP",
+        "success": True,
+        "data": {"token": "valid-oauth-token-123", "expiresIn": 1800},
+    }
 
     with patch.object(httpx.AsyncClient, "request", AsyncMock(return_value=mock_resp)):
         healthy_res = await real_client_with_creds.health_check()
@@ -812,6 +825,7 @@ async def test_real_setu_payload_parser_and_source_tagging():
         client_id="id1",
         client_secret="sec1",
         product_instance_id="inst1",
+        auth_token="test_token",
         force_sandbox_mock=False,
     )
 
@@ -949,4 +963,348 @@ async def test_all_consent_status_transitions():
     client.set_mock_consent_status(consent.id, "REVOKED")
     with pytest.raises(SetuConsentRevokedError):
         await client.get_consent_status(consent.id)
+
+
+# =========================================================
+# REAL SETU AA OAUTH AUTHENTICATION & GATEWAY TESTS (Task 7)
+# =========================================================
+
+# ---------------------------------------------------------
+# 35. Successful OAuth Authentication & Header Composition
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_oauth_successful_authentication():
+    client = SetuAAClient(
+        client_id="test_client_id_123",
+        client_secret="test_secret_abc",
+        product_instance_id="prod_inst_xyz",
+        force_sandbox_mock=False,
+    )
+    mock_token_resp = MagicMock()
+    mock_token_resp.status_code = 200
+    mock_token_resp.json.return_value = {
+        "status": 200,
+        "success": True,
+        "data": {
+            "token": "valid-jwt-token-999",
+            "expiresIn": 1800,
+        },
+    }
+
+    with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=mock_token_resp)) as mock_post:
+        token = await client.get_access_token()
+        assert token == "valid-jwt-token-999"
+
+        # Verify auth URL was called with clientID and secret payload
+        mock_post.assert_called_once()
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {
+            "clientID": "test_client_id_123",
+            "secret": "test_secret_abc",
+        }
+
+        # Verify header composition
+        headers = await client._get_headers()
+        assert headers["Authorization"] == "Bearer valid-jwt-token-999"
+        assert headers["x-product-instance-id"] == "prod_inst_xyz"
+        assert "x-client-id" not in headers
+        assert "x-client-secret" not in headers
+
+
+# ---------------------------------------------------------
+# 36. Invalid Credentials / 401 Rejection
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_oauth_invalid_credentials_401():
+    client = SetuAAClient(
+        client_id="wrong_id",
+        client_secret="wrong_secret",
+        product_instance_id="inst1",
+        force_sandbox_mock=False,
+    )
+    mock_fail_resp = MagicMock()
+    mock_fail_resp.status_code = 401
+    mock_fail_resp.json.return_value = {
+        "error": "unauthorized",
+        "message": "Invalid client credentials",
+    }
+
+    with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=mock_fail_resp)):
+        with pytest.raises(SetuAuthError) as exc_info:
+            await client.get_access_token()
+        assert exc_info.value.code == "SETU_AUTH_FAILED"
+
+        # Health check must report unauthorized
+        res = await client.health_check()
+        assert res["status"] == "unauthorized"
+        assert res["mode"] == "real_setu"
+        assert "verify client ID and secret" in res["error"]
+
+
+# ---------------------------------------------------------
+# 37. Token Expiry & Automatic Refresh Handling
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_oauth_token_expiry_handling():
+    client = SetuAAClient(
+        client_id="test_client",
+        client_secret="test_secret",
+        product_instance_id="test_inst",
+        force_sandbox_mock=False,
+    )
+    # Simulate an expired token in cache
+    client._cached_token = "old-expired-token"
+    client._token_expires_at = time.time() - 30  # Expired 30 seconds ago
+
+    mock_refresh_resp = MagicMock()
+    mock_refresh_resp.status_code = 200
+    mock_refresh_resp.json.return_value = {
+        "success": True,
+        "data": {
+            "token": "new-refreshed-token-2026",
+            "expiresIn": 3600,
+        },
+    }
+
+    with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=mock_refresh_resp)):
+        token = await client.get_access_token()
+        assert token == "new-refreshed-token-2026"
+        assert client._cached_token == "new-refreshed-token-2026"
+        assert client._token_expires_at > time.time() + 3500
+
+
+# ---------------------------------------------------------
+# 38. Gateway 401 Token Refresh & Request Retry
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_oauth_token_refresh_on_gateway_401():
+    client = SetuAAClient(
+        client_id="test_client",
+        client_secret="test_secret",
+        product_instance_id="test_inst",
+        auth_token="initial-token",
+        force_sandbox_mock=False,
+    )
+
+    # 1. Gateway returns 401 on first try
+    resp_gateway_401 = MagicMock()
+    resp_gateway_401.status_code = 401
+
+    # 2. Token refresh endpoint returns new token
+    resp_token_ok = MagicMock()
+    resp_token_ok.status_code = 200
+    resp_token_ok.json.return_value = {
+        "success": True,
+        "data": {"token": "refreshed-after-401", "expiresIn": 1800},
+    }
+
+    # 3. Gateway returns 200 on retry
+    resp_gateway_200 = MagicMock()
+    resp_gateway_200.status_code = 200
+    resp_gateway_200.json.return_value = {"status": "SUCCESS", "data": "recovered"}
+
+    with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=resp_token_ok)):
+        with patch.object(
+            httpx.AsyncClient,
+            "request",
+            AsyncMock(side_effect=[resp_gateway_401, resp_gateway_200]),
+        ) as mock_req:
+            res = await client._request("GET", "/health")
+            assert res == {"status": "SUCCESS", "data": "recovered"}
+            assert mock_req.call_count == 2
+            assert client._cached_token == "refreshed-after-401"
+
+
+# ---------------------------------------------------------
+# 39. Missing Credentials in Real Mode
+# ---------------------------------------------------------
+def test_oauth_missing_credentials_in_real_mode():
+    with pytest.raises(SetuConfigurationError) as exc_info:
+        SetuAAClient(
+            client_id="",
+            client_secret="",
+            product_instance_id="",
+            force_sandbox_mock=False,
+        )
+    assert exc_info.value.code == "SETU_CONFIGURATION_ERROR"
+    missing = exc_info.value.missing_keys
+    assert "SETU_CLIENT_ID" in missing
+    assert "SETU_CLIENT_SECRET" in missing
+    assert "SETU_PRODUCT_INSTANCE_ID" in missing
+
+
+# ---------------------------------------------------------
+# 40. Wrong Product Instance ID Rejection
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_oauth_wrong_product_instance_id():
+    client = SetuAAClient(
+        client_id="valid_client",
+        client_secret="valid_secret",
+        product_instance_id="wrong_instance_id",
+        auth_token="valid_token",
+        force_sandbox_mock=False,
+    )
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 400
+    mock_resp.text = '{"error": "invalid-product-instance-id", "message": "Product instance does not exist"}'
+
+    with patch.object(httpx.AsyncClient, "request", AsyncMock(return_value=mock_resp)):
+        with pytest.raises(SetuAuthError):
+            await client._request("GET", "/health", max_retries=0)
+
+    # In health_check, if token fetch succeeds but gateway rejects product instance with 403 or 400:
+    mock_token_ok = MagicMock()
+    mock_token_ok.status_code = 200
+    mock_token_ok.json.return_value = {
+        "success": True,
+        "data": {"token": "valid_token", "expiresIn": 1800},
+    }
+    with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=mock_token_ok)):
+        with patch.object(httpx.AsyncClient, "request", AsyncMock(return_value=mock_resp)):
+            health_res = await client.health_check()
+            assert health_res["status"] == "unauthorized"
+            assert "rejected authentication or product instance ID" in health_res["error"]
+
+
+# ---------------------------------------------------------
+# 41. Setu OAuth Timeout Handling
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_oauth_auth_timeout():
+    client = SetuAAClient(
+        client_id="client_id",
+        client_secret="client_sec",
+        product_instance_id="inst1",
+        force_sandbox_mock=False,
+    )
+
+    with patch.object(
+        httpx.AsyncClient,
+        "post",
+        AsyncMock(side_effect=httpx.TimeoutException("Connection timed out")),
+    ):
+        with pytest.raises(SetuTimeoutError) as exc_info:
+            await client.get_access_token()
+        assert exc_info.value.code == "SETU_TIMEOUT"
+
+        health = await client.health_check()
+        assert health["status"] == "timeout"
+        assert "timed out" in health["error"]
+
+
+# ---------------------------------------------------------
+# 42. Setu Auth Server Error 5xx Handling
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_oauth_auth_server_error_5xx():
+    client = SetuAAClient(
+        client_id="client_id",
+        client_secret="client_sec",
+        product_instance_id="inst1",
+        force_sandbox_mock=False,
+    )
+
+    mock_503 = MagicMock()
+    mock_503.status_code = 503
+    mock_503.text = "Service Unavailable"
+
+    with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=mock_503)):
+        with pytest.raises(SetuProviderUnavailableError) as exc_info:
+            await client.get_access_token()
+        assert exc_info.value.code == "SETU_UNAVAILABLE"
+
+        health = await client.health_check()
+        assert health["status"] in ("provider_unavailable", "unavailable")
+
+
+# ---------------------------------------------------------
+# 43. Real Setu Mode Never Silently Falls Back to SANDBOX_MOCK
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_real_setu_mode_never_silently_uses_sandbox_mock(monkeypatch):
+    monkeypatch.setattr(settings, "SETU_ENVIRONMENT", "sandbox")
+    monkeypatch.setattr(settings, "SETU_CLIENT_ID", "live_client_id")
+    monkeypatch.setattr(settings, "SETU_CLIENT_SECRET", "live_secret")
+    monkeypatch.setattr(settings, "SETU_PRODUCT_INSTANCE_ID", "live_product_instance")
+
+    # In sandbox/real_setu mode, force_sandbox_mock is not provided
+    client = SetuAAClient()
+    assert client.use_mock is False
+
+    # Simulate Setu Gateway returning 500
+    mock_500 = MagicMock()
+    mock_500.status_code = 500
+
+    # Ensure get_data throws error, NEVER returning mock bank/equities
+    with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=MagicMock(status_code=200, json=lambda: {"data": {"token": "jwt", "expiresIn": 1800}}))):
+        with patch.object(httpx.AsyncClient, "request", AsyncMock(return_value=mock_500)):
+            with pytest.raises(SetuProviderUnavailableError):
+                await client.get_data("consent-test-strict-real")
+
+            # Health check must report provider_unavailable, NEVER healthy with sandbox_mock
+            health = await client.health_check()
+            assert health["mode"] == "real_setu"
+            assert health["status"] in ("provider_unavailable", "unavailable")
+
+
+# ---------------------------------------------------------
+# 44. Setu Sandbox Exact Configuration & Bearer Header Verification
+# ---------------------------------------------------------
+@pytest.mark.anyio
+async def test_setu_sandbox_exact_config_and_bearer_headers():
+    test_client_id = "6896da69-c53c-476a-a4f5-16f608c63cf9"
+    test_product_inst_id = "2d842846-71aa-4642-8d09-f7555ef15236"
+    test_auth_url = "https://uat.setu.co/api/v2/auth/token"
+    test_base_url = "https://fiu-sandbox.setu.co"
+
+    client = SetuAAClient(
+        base_url=test_base_url,
+        auth_url=test_auth_url,
+        client_id=test_client_id,
+        client_secret="mock_test_secret_for_unit_test",
+        product_instance_id=test_product_inst_id,
+        force_sandbox_mock=False,
+    )
+
+    mock_oauth_resp = MagicMock()
+    mock_oauth_resp.status_code = 200
+    mock_oauth_resp.json.return_value = {
+        "status": 200,
+        "success": True,
+        "data": {
+            "token": "sandbox-jwt-bearer-token-xyz",
+            "expiresIn": 1800,
+        },
+    }
+
+    mock_gateway_resp = MagicMock()
+    mock_gateway_resp.status_code = 200
+    mock_gateway_resp.json.return_value = {"status": "UP"}
+
+    with patch.object(httpx.AsyncClient, "post", AsyncMock(return_value=mock_oauth_resp)) as mock_post:
+        with patch.object(httpx.AsyncClient, "request", AsyncMock(return_value=mock_gateway_resp)) as mock_req:
+            # 1. Verify token retrieval targets the exact auth URL with clientID
+            token = await client.get_access_token()
+            assert token == "sandbox-jwt-bearer-token-xyz"
+            mock_post.assert_called_once()
+            called_auth_url = mock_post.call_args[0][0]
+            assert called_auth_url == "https://uat.setu.co/api/v2/auth/token"
+            assert mock_post.call_args[1]["json"]["clientID"] == test_client_id
+
+            # 2. Verify subsequent AA request has Bearer token and product instance ID
+            res = await client._request("GET", "/health")
+            assert res == {"status": "UP"}
+            mock_req.assert_called_once()
+            method, gateway_url = mock_req.call_args[0][:2]
+            headers = mock_req.call_args[1]["headers"]
+            assert gateway_url == "https://fiu-sandbox.setu.co/health"
+            assert headers["Authorization"] == "Bearer sandbox-jwt-bearer-token-xyz"
+            assert headers["x-product-instance-id"] == test_product_inst_id
+            # Crucial: verify x-client-id and x-client-secret are NOT in gateway headers
+            assert "x-client-id" not in headers
+            assert "x-client-secret" not in headers
+
+
 

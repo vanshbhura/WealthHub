@@ -135,6 +135,8 @@ class SetuAAClient:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         product_instance_id: Optional[str] = None,
+        auth_url: Optional[str] = None,
+        auth_token: Optional[str] = None,
         timeout: Optional[float] = None,
         force_sandbox_mock: Optional[bool] = None,
     ):
@@ -144,19 +146,34 @@ class SetuAAClient:
         self.product_instance_id = product_instance_id or settings.SETU_PRODUCT_INSTANCE_ID
         self.timeout = timeout or settings.SETU_TIMEOUT_SECONDS
 
-        # Determine operating mode: MOCK vs REAL SETU SANDBOX
+        # Auth URL resolution
+        if auth_url:
+            self.auth_url = auth_url.rstrip("/")
+        elif settings.SETU_AUTH_URL:
+            self.auth_url = settings.SETU_AUTH_URL.rstrip("/")
+        else:
+            is_prod = "fiu.setu.co" in self.base_url and "sandbox" not in self.base_url
+            if settings.SETU_ENVIRONMENT.lower() in ("production", "prod") or is_prod:
+                self.auth_url = "https://prod.setu.co/api/v2/auth/token"
+            else:
+                self.auth_url = "https://uat.setu.co/api/v2/auth/token"
+
+        # Token caching
+        self._cached_token: Optional[str] = auth_token
+        self._token_expires_at: Optional[float] = (time.time() + 86400) if auth_token else None
+
+        # Determine operating mode: MOCK vs REAL SETU
+        # Rule: Do not fall back to SANDBOX_MOCK when SETU_ENVIRONMENT=sandbox/real_setu
         if force_sandbox_mock is not None:
             self.use_mock = force_sandbox_mock
             if not self.use_mock:
-                # Real mode explicitly forced: credentials MUST be verified
                 self.validate_credentials()
         else:
-            # Default behavior: if credentials are provided and environment is sandbox, use real;
-            # otherwise, fallback to internal mock for fast/offline test execution and local dev.
-            has_creds = bool(self.client_id and self.client_secret and self.product_instance_id)
-            if settings.SETU_ENVIRONMENT == "mock" or not has_creds:
+            env = (settings.SETU_ENVIRONMENT or "mock").lower()
+            if env in ("mock", "sandbox_mock"):
                 self.use_mock = True
             else:
+                # Real Setu mode: never fall back to mock
                 self.use_mock = False
 
         # In-memory store for mock mode lifecycle simulation
@@ -182,15 +199,134 @@ class SetuAAClient:
         if missing:
             raise SetuConfigurationError(missing_keys=missing)
 
-    def _get_headers(self) -> Dict[str, str]:
+    async def get_access_token(self, force_refresh: bool = False) -> str:
+        """
+        Retrieves or generates an OAuth access token using clientID and secret.
+        Caches the token until shortly before expiry (default 60s buffer).
+        Never logs or exposes client_secret.
+        Retries on transient 5xx/network errors, but fails fast on 4xx invalid credentials.
+        """
+        self.validate_credentials()
+
+        now = time.time()
+        # Use cached token if valid and not forcing refresh (buffer 60 seconds)
+        if (
+            not force_refresh
+            and self._cached_token
+            and self._token_expires_at
+            and (self._token_expires_at - now > 60)
+        ):
+            return self._cached_token
+
+        payload = {
+            "clientID": self.client_id,
+            "secret": self.client_secret,
+        }
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        if self.client_id:
-            headers["x-client-id"] = self.client_id
-        if self.client_secret:
-            headers["x-client-secret"] = self.client_secret
+
+        retries = 0
+        max_retries = 2
+        start_time = time.time()
+
+        while retries <= max_retries:
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.post(self.auth_url, json=payload, headers=headers)
+                    duration_ms = round((time.time() - start_time) * 1000, 2)
+
+                    if resp.status_code in (200, 201):
+                        log_safe_structured_event(
+                            "auth_token_success",
+                            http_status=resp.status_code,
+                            duration_ms=duration_ms,
+                        )
+                        try:
+                            body = resp.json()
+                        except Exception as e:
+                            logger.error("Setu auth service returned non-JSON response: %s", type(e).__name__)
+                            raise SetuInvalidResponseError("Malformed JSON received from Setu auth service.")
+
+                        data = body.get("data") if isinstance(body.get("data"), dict) else body
+                        token = (
+                            data.get("token")
+                            or data.get("access_token")
+                            or body.get("token")
+                            or body.get("access_token")
+                        )
+                        expires_in = (
+                            data.get("expiresIn")
+                            or data.get("expires_in")
+                            or body.get("expiresIn")
+                            or body.get("expires_in")
+                            or 1800
+                        )
+
+                        if not token or not isinstance(token, str):
+                            logger.error("Setu auth response missing token field")
+                            raise SetuInvalidResponseError("Setu auth response missing access token.")
+
+                        self._cached_token = token
+                        self._token_expires_at = time.time() + float(expires_in)
+                        return self._cached_token
+
+                    elif resp.status_code in (400, 401, 403):
+                        log_safe_structured_event(
+                            "auth_token_failure",
+                            http_status=resp.status_code,
+                            duration_ms=duration_ms,
+                        )
+                        # Do NOT retry credential errors
+                        raise SetuAuthError("Setu AA authentication failed. Please verify client ID and secret.")
+
+                    elif resp.status_code == 429:
+                        retries += 1
+                        if retries <= max_retries:
+                            await asyncio.sleep(1.0 * retries)
+                            continue
+                        raise SetuRateLimitError("Setu AA authentication rate limit exceeded.")
+
+                    elif resp.status_code >= 500:
+                        retries += 1
+                        if retries <= max_retries:
+                            await asyncio.sleep(1.0 * retries)
+                            continue
+                        raise SetuProviderUnavailableError(f"Setu auth service error (HTTP {resp.status_code}).")
+
+                    else:
+                        raise SetuInvalidResponseError(f"Setu auth service returned unexpected status {resp.status_code}.")
+
+            except (httpx.TimeoutException, httpx.ConnectTimeout):
+                retries += 1
+                if retries <= max_retries:
+                    await asyncio.sleep(1.0 * retries)
+                    continue
+                raise SetuTimeoutError("Setu AA authentication request timed out.")
+
+            except (httpx.ConnectError, httpx.NetworkError):
+                retries += 1
+                if retries <= max_retries:
+                    await asyncio.sleep(1.0 * retries)
+                    continue
+                raise SetuProviderUnavailableError("Unable to establish connection to Setu auth service.")
+
+            except (SetuClientError, SetuAuthError, SetuTimeoutError, SetuProviderUnavailableError, SetuInvalidResponseError, SetuRateLimitError):
+                raise
+
+            except Exception as e:
+                raise SetuClientError(f"Unexpected error during Setu token retrieval: {str(e)}")
+
+        raise SetuProviderUnavailableError("Setu AA authentication service unavailable after retries.")
+
+    async def _get_headers(self, force_refresh: bool = False) -> Dict[str, str]:
+        token = await self.get_access_token(force_refresh=force_refresh)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
         if self.product_instance_id:
             headers["x-product-instance-id"] = self.product_instance_id
         return headers
@@ -204,12 +340,15 @@ class SetuAAClient:
     ) -> Dict[str, Any]:
         """
         Executes HTTP request with structured error handling, retries, and sensitive redaction.
+        Uses OAuth Bearer token authentication.
+        Automatically handles token refresh on 401.
         Never logs sensitive payloads or credentials.
         """
         self.validate_credentials()
         url = f"{self.base_url}{path}"
-        headers = self._get_headers()
+        headers = await self._get_headers()
         retries = 0
+        refreshed_on_401 = False
         start_time = time.time()
 
         while retries <= max_retries:
@@ -232,13 +371,31 @@ class SetuAAClient:
                             raise SetuInvalidResponseError("Malformed JSON response received from Setu AA service.")
 
                     elif resp.status_code in (401, 403):
+                        # Attempt token refresh once if token might have expired on server
+                        if not refreshed_on_401 and resp.status_code == 401:
+                            refreshed_on_401 = True
+                            try:
+                                headers = await self._get_headers(force_refresh=True)
+                                continue
+                            except SetuAuthError:
+                                pass
                         log_safe_structured_event(
                             "http_auth_failure",
                             http_status=resp.status_code,
                             duration_ms=duration_ms,
                             path=path,
                         )
-                        raise SetuAuthError("Setu AA authentication failed. Please check client credentials.")
+                        raise SetuAuthError("Setu AA authentication failed. Please check client credentials or product instance ID.")
+
+                    elif resp.status_code == 400:
+                        err_text = ""
+                        try:
+                            err_text = resp.text
+                        except Exception:
+                            pass
+                        if "product" in err_text.lower() or "instance" in err_text.lower():
+                            raise SetuAuthError("Setu AA rejected request due to invalid product instance ID.")
+                        raise SetuInvalidResponseError(f"Setu AA bad request (HTTP 400): {path}")
 
                     elif resp.status_code == 404:
                         raise SetuInvalidResponseError(f"Setu resource not found: {path}")
@@ -638,8 +795,44 @@ class SetuAAClient:
             }
 
         start_time = time.time()
+        # 1. Verify Authentication by generating/requesting an OAuth access token
         try:
-            # Probe Setu AA sandbox endpoint
+            await self.get_access_token(force_refresh=True)
+        except SetuAuthError:
+            return {
+                "status": "unauthorized",
+                "mode": "real_setu",
+                "base_url": self.base_url,
+                "error": "Setu AA authentication failed. Please verify client ID and secret.",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        except SetuTimeoutError:
+            return {
+                "status": "timeout",
+                "mode": "real_setu",
+                "base_url": self.base_url,
+                "error": "Setu AA authentication service connection timed out.",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        except SetuProviderUnavailableError:
+            return {
+                "status": "provider_unavailable",
+                "mode": "real_setu",
+                "base_url": self.base_url,
+                "error": "Setu AA authentication service is unreachable or returned server error.",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        except Exception as e:
+            return {
+                "status": "degraded",
+                "mode": "real_setu",
+                "base_url": self.base_url,
+                "error": f"Setu authentication check failed: {str(e)}",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+        # 2. Verify AA Gateway connectivity with authenticated headers and product-instance-id
+        try:
             await self._request("GET", "/health", max_retries=1)
             duration_ms = round((time.time() - start_time) * 1000, 2)
             return {
@@ -654,7 +847,7 @@ class SetuAAClient:
                 "status": "unauthorized",
                 "mode": "real_setu",
                 "base_url": self.base_url,
-                "error": "Setu AA authentication failed. Please verify client ID and secret.",
+                "error": "Setu AA gateway rejected authentication or product instance ID.",
                 "timestamp": datetime.utcnow().isoformat(),
             }
         except SetuTimeoutError:
@@ -667,7 +860,7 @@ class SetuAAClient:
             }
         except SetuProviderUnavailableError:
             return {
-                "status": "unavailable",
+                "status": "provider_unavailable",
                 "mode": "real_setu",
                 "base_url": self.base_url,
                 "error": "Setu AA service is unreachable or returned server error.",
